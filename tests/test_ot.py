@@ -2,9 +2,10 @@
 
 系统采用中央服务器单一全序（Jupiter 星型）：每个迟到补丁只沿服务端
 提交顺序依次重放。需要保证的核心性质是 TP1 —— 同一基准上的 *两份*
-并发补丁，无论谁先到服务端，最终文本相同；纯插入场景因同点按补丁
-标识字典序定序，任意数量都收敛。多补丁场景在固定服务端顺序下结果
-确定（服务端怎么算，终端就看到什么）。
+并发补丁，无论谁先到服务端，最终文本相同；在此基础上，同点插入按
+``(原始基准位置, 补丁标识)`` 定序、删除与插入交叠时插入内容保留、
+重叠删除取并集，使得任意数量的并发补丁（插入/删除混合）按任意提交
+顺序都收敛到唯一文本。
 """
 
 from __future__ import annotations
@@ -155,7 +156,38 @@ def test_random_pairs_convergence():
         assert_pair_convergent(base, ops[0], ops[1])
 
 
+# ---- 点名场景：删除把两个不同位置的插入挤到同一空隙，三补丁六序收敛 --
+def test_delete_coalesces_inserts_all_orders():
+    base = "0123456789abcdefg"
+    ops = [
+        ot.make_ins(11, "A", "A"),   # 原位置 11
+        ot.make_ins(10, "B", "B"),   # 原位置 10
+        ot.make_del(9, 12, "D"),     # 删除 "9ab"
+    ]
+    final = assert_all_orders_convergent(base, ops)
+    assert final == "012345678BAcdefg", final
+
+
 # ---- 固定服务端顺序下多补丁结果确定且等于逐字符并集语义 ----------------
+# ---- 多补丁（插入/删除混合）任意提交序全排列收敛 -----------------------
+def test_random_multi_patches_all_orders_convergent():
+    rng = random.Random(20260925)
+    alphabet = "甲乙丙丁ABC012"
+    for _ in range(800):
+        base = "".join(rng.choice(alphabet) for _ in range(rng.randint(3, 10)))
+        n = len(base)
+        k = rng.choice((3, 4))
+        ops = []
+        for j in range(k):  # 标识互不相同，对应三台以上离线终端
+            if rng.random() < 0.5:
+                ops.append(ot.make_ins(rng.randint(0, n),
+                                       rng.choice("XY插入"), f"p-{j}"))
+            else:
+                lo = rng.randint(0, n)
+                ops.append(ot.make_del(lo, rng.randint(lo, n), f"p-{j}"))
+        assert_all_orders_convergent(base, ops)
+
+
 def test_multi_patch_deterministic_under_server_order():
     # 三台终端基于同一旧修订并发，按某个固定服务端顺序依次到达
     base = "0123456789"

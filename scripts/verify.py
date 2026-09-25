@@ -12,12 +12,15 @@
   6. 业务复核 B：删除区间内并发插入的保留结果（两种提交序收敛）
   7. 重启持久化冒烟（停服再起：历史转换旧修订补丁、幂等不增修订）
   8. 业务复核 C：拒绝提交后全文与修订号逐字节不变（打 compose app）
+  9. 业务复核 D：两个插入与删除区间交叠的三项 revision 0 旧补丁，
+     六种提交排列各自打到全新实例，最终全文必须唯一确定
 
 任何一步失败：继续执行剩余检查以便完整报告，但最终以非零退出。
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
@@ -334,6 +337,42 @@ def phase8_rejection_leaves_unchanged():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def phase9_three_offline_patches_six_orders():
+    step(9, "业务复核 D：A/B 插入与删除交叠，三种补丁六种提交序收敛")
+    base_text = "0123456789abcdefg"
+    expected = "012345678BAcdefg"
+    patches = {
+        "A": ("insert", {"pos": 11, "text": "A"}),
+        "B": ("insert", {"pos": 10, "text": "B"}),
+        "D": ("delete", {"lo": 9, "hi": 12, "length": 3}),
+    }
+
+    results = {}
+    for n, order in enumerate(itertools.permutations(("A", "B", "D"))):
+        d = fresh_dir()
+        # 预置全新状态：初始全文 base_text、修订 0、无历史
+        with open(os.path.join(d, "state.json"), "w", encoding="utf-8") as fh:
+            json.dump({"text": base_text, "revision": 0, "patches": []},
+                      fh, ensure_ascii=False)
+        with local_server(18007 + n, d) as base:
+            for pid in order:  # 到达时仍带 revision 0
+                kind, payload = patches[pid]
+                st, _, r = post_patch(base, f"biz-{pid}", kind, payload, rev=0)
+                check(st == 200 and not r.get("idempotent"),
+                      f"[{''.join(order)}] 补丁 {pid} 以修订 0 基准确认")
+            _, _, doc = http("GET", f"{base}/api/document")
+            results[order] = doc["text"]
+            check(doc["revision"] == 3,
+                  f"[{''.join(order)}] 共产生 3 个连续修订")
+        shutil.rmtree(d, ignore_errors=True)
+
+    for order, text in results.items():
+        check(text == expected,
+              f"[{''.join(order)}] 最终全文为 {text!r}（期望 {expected!r}）")
+    check(len(set(results.values())) == 1,
+          "六种提交排列结果唯一确定，与补丁到达顺序无关")
+
+
 def main() -> int:
     phase1_smoke_static()
     phase2_concurrent_insert()
@@ -343,6 +382,7 @@ def main() -> int:
     phase6_insert_inside_delete()
     phase7_restart_persistence()
     phase8_rejection_leaves_unchanged()
+    phase9_three_offline_patches_six_orders()
 
     print("\n" + "=" * 72)
     if _failures:

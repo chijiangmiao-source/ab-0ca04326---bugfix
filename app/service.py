@@ -196,6 +196,8 @@ class Service:
             new_text = ot.apply_pieces(snap["text"], pieces)
             new_revision = current_revision + 1
 
+            # 落库 pieces 含第 5 项 origin（补丁原始基准位置）：迟到补丁
+            # 重放与同点定序依赖它，重启后仍须可用，故随记录一起持久化
             serial_pieces = [list(p) for p in pieces]
             record = {
                 "id": pid,

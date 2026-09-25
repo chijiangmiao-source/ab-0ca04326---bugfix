@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import tempfile
@@ -55,7 +56,7 @@ def test_insert_confirmation():
     r = svc.submit(ins("p1", 3, "XY"))
     assert r["revision"] == 1
     assert r["text"] == "012XY3456789"
-    assert r["pieces"] == [["ins", 3, "XY", "p1"]]
+    assert r["pieces"] == [["ins", 3, "XY", "p1", 3]]
     assert svc.document()["revision"] == 1
 
 
@@ -170,14 +171,14 @@ def test_late_insert_transformed_over_delete():
     assert r["base_revision"] == 0
     assert r["revision"] == 2
     assert r["text"] == "012K6789"
-    assert r["pieces"] == [["ins", 3, "K", "late"]]
+    assert r["pieces"] == [["ins", 3, "K", "late", 4]]  # 落点 3，原始位置 4
 
 
 def test_late_insert_after_delete_shifts_back():
     svc = new_service()
     svc.submit(dele("d", 2, 4))  # 删 "23"
     r = svc.submit(ins("late", 8, "Z"))  # 原 pos 8 在删除之后 → 前移 2
-    assert r["pieces"] == [["ins", 6, "Z", "late"]]
+    assert r["pieces"] == [["ins", 6, "Z", "late", 8]]
     assert r["text"] == "014567Z89"
 
 
@@ -185,8 +186,8 @@ def test_late_delete_split_by_insert():
     svc = new_service()
     svc.submit(ins("i", 5, "K"))  # 修订 1: "01234K56789"
     r = svc.submit(dele("late", 4, 7))
-    assert r["pieces"] == [["del", 4, 5, "late"],
-                           ["del", 6, 8, "late"]]
+    assert r["pieces"] == [["del", 4, 5, "late", 4],
+                           ["del", 6, 8, "late", 4]]
     assert r["text"] == "0123K789"
 
 
@@ -237,6 +238,63 @@ def test_concurrent_insert_inside_delete_service_convergence():
     assert run("ab") == run("ba") == "01KEEP789"
 
 
+# ---- 点名场景：三项基于 revision 0 的旧补丁，六种提交序必须收敛 ---------
+def test_three_offline_patches_six_orders_convergent():
+    base3 = "0123456789abcdefg"
+    # 三台离线终端基于同一修订 0 各自起草：
+    # A 在位置 11 插 "A"，B 在位置 10 插 "B"，D 删除半开区间 [9,12)
+    patch_a = ins("A", 11, "A", rev=0)
+    patch_b = ins("B", 10, "B", rev=0)
+    patch_d = dele("D", 9, 12, rev=0)
+    by_id = {"A": patch_a, "B": patch_b, "D": patch_d}
+    expected = "012345678BAcdefg"  # [9,12) 的 "9ab" 删除；BA 按原始位置序
+
+    finals = {}
+    for order in itertools.permutations(("A", "B", "D")):
+        # 每种排列各自建立独立的全新文档状态
+        tmp = tempfile.mkdtemp(prefix="ot-six-")
+        svc = Service(Store(os.path.join(tmp, "state.json"),
+                            initial_text=base3))
+        # 补丁到达时仍带 revision 0，依次走现有提交入口
+        for pid in order:
+            r = svc.submit(by_id[pid])
+            assert r["idempotent"] is False
+        snap = svc.document()
+        assert snap["revision"] == 3, order
+        finals[order] = snap["text"]
+
+    distinct = set(finals.values())
+    assert distinct == {expected}, (
+        "六种提交序未收敛到唯一全文："
+        + "; ".join(f"{''.join(o)} -> {t!r}" for o, t in finals.items()))
+
+
+# ---- 旧版状态文件（pieces 为四元组、无 origin）仍可加载并继续变换 ------
+def test_legacy_four_tuple_pieces_still_replay():
+    base = "0123456789"
+    tmp = tempfile.mkdtemp(prefix="ot-legacy-")
+    path = os.path.join(tmp, "state.json")
+    legacy = {
+        "text": "01234K56789",
+        "revision": 1,
+        "patches": [{
+            "id": "i", "base_revision": 0, "revision": 1,
+            "kind": "insert",
+            "payload": {"pos": 5, "text": "K"},
+            "pieces": [["ins", 5, "K", "i"]],  # 旧格式：无 origin
+            "base_text": base,
+            "result_text": "01234K56789",
+        }],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(legacy, fh, ensure_ascii=False)
+    svc = Service(Store(path))
+    # 基于修订 0 的迟到删除越过旧格式插入历史，仍正确切开并保留 K
+    r = svc.submit(dele("late", 4, 7, rev=0))
+    assert r["text"] == "0123K789"
+    assert svc.document()["revision"] == 2
+
+
 def test_rejected_submit_leaves_state_untouched():
     svc = new_service()
     svc.submit(dele("d", 0, 3))
@@ -275,6 +333,6 @@ def test_state_file_single_json_and_no_temp_leftovers():
         data = json.load(fh)
     assert data["revision"] == 1
     assert data["text"] == "0Q123456789"
-    assert data["patches"][0]["pieces"] == [["ins", 1, "Q", "p"]]
+    assert data["patches"][0]["pieces"] == [["ins", 1, "Q", "p", 1]]
     leftovers = [n for n in os.listdir(tmp) if n.startswith(".state-")]
     assert leftovers == []
