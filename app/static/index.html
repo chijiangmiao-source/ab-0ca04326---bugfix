@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>低温联锁规程 · 离线补丁补传</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>低温联锁规程 · 补丁补传终端</h1>
+  <div class="meta">
+    <span>服务端当前修订：<strong id="server-rev">…</strong></span>
+    <span id="health" class="badge">连接中…</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>服务端确认全文（权威）</h2>
+    <p class="hint">本区域始终来自真实接口 <code>GET /api/document</code>，刷新页面后以此为准。</p>
+    <textarea id="doc" readonly rows="10" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="refresh">重新拉取全文</button>
+      <button id="new-draft" class="primary">建立草案（读取全文与修订号）</button>
+    </div>
+  </section>
+
+  <section id="draft-card" class="card hidden">
+    <h2>本地草案 <span id="draft-tag" class="badge warn">未经服务端批准</span></h2>
+    <p class="hint">
+      草案基于本终端保存的基准修订 <strong id="draft-base">?</strong>。
+      可在下方文本中点击/选择以自动取位；提交后以服务端确认结果为准。
+    </p>
+    <textarea id="draft-doc" readonly rows="8" spellcheck="false"></textarea>
+
+    <div class="form">
+      <label>补丁标识 id（同位置插入按 id 字典序定序）
+        <input id="patch-id" type="text">
+      </label>
+      <div class="row">
+        <label class="kind"><input type="radio" name="kind" value="insert" checked> 插入</label>
+        <label class="kind"><input type="radio" name="kind" value="delete"> 删除</label>
+      </div>
+
+      <div id="insert-fields">
+        <label>插入位置 pos
+          <input id="ins-pos" type="number" min="0">
+        </label>
+        <label>插入内容 text
+          <textarea id="ins-text" rows="2"></textarea>
+        </label>
+      </div>
+
+      <div id="delete-fields" class="hidden">
+        <div class="row">
+          <label>删除起点 lo <input id="del-lo" type="number" min="0"></label>
+          <label>删除终点 hi <input id="del-hi" type="number" min="0"></label>
+        </div>
+        <div class="row">
+          <label>删除长度 length（可选，须与 hi-lo 一致）
+            <input id="del-length" type="number" min="0" placeholder="自动校验">
+          </label>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="submit" class="primary">提交补丁</button>
+        <button id="discard">放弃草案</button>
+        <span id="pick-hint" class="hint"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="result-card" class="card hidden">
+    <h2>服务端确认结果</h2>
+    <p>
+      新修订：<strong id="res-rev"></strong>
+      <span id="res-idem" class="badge hidden">相同载荷重传 · 未新增修订</span>
+    </p>
+    <p class="hint">实际落点（规范化结果，坐标针对确认时的最新全文）：</p>
+    <pre id="res-pieces"></pre>
+    <h3>确认全文</h3>
+    <pre id="res-text" class="result-text"></pre>
+  </section>
+
+  <section id="error-card" class="card hidden error">
+    <h2>提交被拒绝</h2>
+    <p id="err-msg"></p>
+    <p class="hint">规程文本与修订号均未改变，当前权威全文仍为：</p>
+    <pre id="err-text" class="result-text"></pre>
+  </section>
+
+  <section id="local-card" class="card hidden">
+    <h2>本终端保存的状态</h2>
+    <p id="local-info" class="hint"></p>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
