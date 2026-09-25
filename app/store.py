@@ -91,6 +91,20 @@ class Store:
                     out.append(json.loads(json.dumps(rec["pieces"])))
             return out
 
+    def records_since(self, base_revision: int) -> List[Dict[str, Any]]:
+        """返回修订号 > base_revision 的已确认补丁完整记录（按修订顺序）。"""
+        with self._lock:
+            return [json.loads(json.dumps(rec))
+                    for rec in self._state["patches"]
+                    if rec["revision"] > base_revision]
+
+    def all_records(self) -> List[Dict[str, Any]]:
+        """按修订顺序返回全部已确认补丁记录（用于重启重建身份状态）。"""
+        with self._lock:
+            return [json.loads(json.dumps(rec))
+                    for rec in sorted(self._state["patches"],
+                                      key=lambda r: r["revision"])]
+
     # ---- 写入 ----------------------------------------------------------
     def commit(self, record: Dict[str, Any], new_text: str) -> None:
         """原子保存新全文、新修订号与本补丁规范化结果。"""

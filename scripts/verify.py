@@ -10,8 +10,10 @@
   4. 构建检查（Python compileall；node --check 校验前端 JS 语法）
   5. 接口冒烟（草案/文档/补丁 happy path 与 404/400）
   6. 业务复核 B：删除区间内并发插入的保留结果（两种提交序收敛）
-  7. 重启持久化冒烟（停服再起：历史转换旧修订补丁、幂等不增修订）
-  8. 业务复核 C：拒绝提交后全文与修订号逐字节不变（打 compose app）
+  7. 业务复核 D：三个 rev0 离线补丁（A@11/B@10 插入、D[9,12) 删除）
+     六种提交排列各自独立新文档，最终全文唯一确定
+  8. 重启持久化冒烟（停服再起：历史转换旧修订补丁、幂等不增修订）
+  9. 业务复核 C：拒绝提交后全文与修订号逐字节不变（打 compose app）
 
 任何一步失败：继续执行剩余检查以便完整报告，但最终以非零退出。
 """
@@ -253,8 +255,47 @@ def phase6_insert_inside_delete():
           "（后文若有相同单字属正常，故按连续片段判定）")
 
 
-def phase7_restart_persistence():
-    step(7, "重启持久化冒烟：旧修订补丁历史转换、幂等不增修订")
+def phase7_six_orders_convergence():
+    step(7, "业务复核 D：三个 rev0 离线补丁六种提交排列必须唯一收敛")
+    import itertools
+    base_text = "0123456789abcdefg"
+    expected = "012345678BAcdefg"
+    patch_reqs = {
+        "A": {"id": "off-A", "kind": "insert", "base_revision": 0,
+              "payload": {"pos": 11, "text": "A"}},
+        "B": {"id": "off-B", "kind": "insert", "base_revision": 0,
+              "payload": {"pos": 10, "text": "B"}},
+        "D": {"id": "off-D", "kind": "delete", "base_revision": 0,
+              "payload": {"lo": 9, "hi": 12}},
+    }
+    results = {}
+    for n, order in enumerate(itertools.permutations("ABD")):
+        d = fresh_dir()
+        # 预置全新文档：初始全文 base_text、修订号 0、无历史
+        with open(os.path.join(d, "state.json"), "w", encoding="utf-8") as fh:
+            json.dump({"text": base_text, "revision": 0, "patches": []},
+                      fh, ensure_ascii=False)
+        with local_server(18010 + n, d) as base:
+            for key in order:
+                st, _, r = http("POST", f"{base}/api/patches", patch_reqs[key])
+                check(st == 200 and r.get("idempotent") is False,
+                      f"[{''.join(order)}] 补丁 {key}（base_revision=0）确认")
+            _, _, doc = http("GET", f"{base}/api/document")
+            results["".join(order)] = doc["text"]
+            check(doc["revision"] == 3,
+                  f"[{''.join(order)}] 共产生 3 个连续修订")
+        shutil.rmtree(d, ignore_errors=True)
+
+    unique = set(results.values())
+    for order, text in sorted(results.items()):
+        check(text == expected, f"排列 {order} 最终全文为 {expected!r}"
+                                f"（实际 {text!r}）")
+    check(len(unique) == 1,
+          f"六种排列最终全文唯一（共 {len(unique)} 种）：{unique!r}")
+
+
+def phase8_restart_persistence():
+    step(8, "重启持久化冒烟：旧修订补丁历史转换、幂等不增修订")
     d = fresh_dir()
     with local_server(18005, d) as base:
         st, _, r1 = post_patch(base, "keep-a", "insert",
@@ -281,8 +322,8 @@ def phase7_restart_persistence():
     shutil.rmtree(d, ignore_errors=True)
 
 
-def phase8_rejection_leaves_unchanged():
-    step(8, "业务复核 C：拒绝提交后全文与修订号保持不变（compose app）")
+def phase9_rejection_leaves_unchanged():
+    step(9, "业务复核 C：拒绝提交后全文与修订号保持不变（compose app）")
     _, _, before = http("GET", f"{APP_URL}/api/document")
     bad_cases = [
         ("未来修订", {"id": f"bad-future-{time.time_ns()}", "kind": "insert",
@@ -341,8 +382,9 @@ def main() -> int:
     phase4_build_checks()
     phase5_smoke_api()
     phase6_insert_inside_delete()
-    phase7_restart_persistence()
-    phase8_rejection_leaves_unchanged()
+    phase7_six_orders_convergence()
+    phase8_restart_persistence()
+    phase9_rejection_leaves_unchanged()
 
     print("\n" + "=" * 72)
     if _failures:

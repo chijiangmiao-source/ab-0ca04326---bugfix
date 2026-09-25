@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, Tuple
 
-from . import ot
+from . import anchors, ot
 from .store import Store
 
 
@@ -21,6 +21,11 @@ class Service:
     def __init__(self, store: Store) -> None:
         self._store = store
         self._lock = threading.Lock()
+        # 字符身份状态：从修订号 0 全文与全部补丁历史重建，使重启后
+        # 旧修订补丁的身份计算与首次运行完全一致
+        self._anchors = anchors.AnchorIndex(store.initial_text())
+        for rec in store.all_records():
+            self._anchors.replay_record(rec)
 
     def document(self) -> Dict[str, Any]:
         return self._store.snapshot()
@@ -134,6 +139,18 @@ class Service:
             return pid, ot.make_del(lo, hi, pid), norm
         raise Reject("kind 必须是 insert 或 delete", "bad_request")
 
+    def _with_anchors(self, rec: Dict[str, Any]) -> list:
+        """给已确认插入补丁的历史片段补上首字符全局身份。
+
+        删除片段无需身份。身份从内存身份状态按补丁标识取（该标识已
+        唯一占用，重启重放历史时同样已登记）。
+        """
+        pieces = rec["pieces"]
+        if rec["kind"] != "insert":
+            return [tuple(p) for p in pieces]
+        anchor = self._anchors.anchor_of(rec["id"])[0]
+        return [(p[0], p[1], p[2], p[3], anchor) for p in pieces]
+
     @staticmethod
     def _validate_pieces(pieces, doc_len: int) -> None:
         for p in pieces:
@@ -189,14 +206,42 @@ class Service:
             base_text = self._base_text(base_revision)
             pid, op, norm_payload = self._parse_op(req, len(base_text))
 
-            # 迟到补丁：依次变换越过基准修订之后的全部已确认补丁
-            history = self._store.history_since(base_revision)
+            # 字符身份在补丁自身基准修订的视图上确定：与其他补丁是否
+            # 已到达无关，因此六种（乃至任意）提交排列产生同一身份序列
+            is_insert = req.get("kind") == "insert"
+            if is_insert:
+                ids = self._anchors.insert_ids(
+                    base_revision, norm_payload["pos"],
+                    norm_payload["text"], pid)
+                op = ot.make_ins(norm_payload["pos"],
+                                 norm_payload["text"], pid, ids[0])
+            else:
+                killed = self._anchors.deleted_ids(
+                    base_revision, norm_payload["lo"], norm_payload["hi"])
+
+            # 迟到补丁：依次变换越过基准修订之后的全部已确认补丁。
+            # 历史插入片段需补上其首字符身份，同位置相遇时才能按
+            # “原始空隙先后 + 标识字典序” 定序，而不是只按标识排序。
+            records = self._store.records_since(base_revision)
+            history = [self._with_anchors(rec) for rec in records]
             pieces = ot.rebase(op, history)
             self._validate_pieces(pieces, len(snap["text"]))
             new_text = ot.apply_pieces(snap["text"], pieces)
             new_revision = current_revision + 1
 
-            serial_pieces = [list(p) for p in pieces]
+            # 身份模型是位置模型的参照：先在不改动身份状态的前提下预览，
+            # 两者全文必须逐字一致；不一致则拒绝且不产生任何写盘/副作用
+            if is_insert:
+                anchored_text = self._anchors.preview_insert(
+                    ids, norm_payload["text"])
+            else:
+                anchored_text = self._anchors.preview_delete(killed)
+            if anchored_text != new_text:
+                raise Reject(
+                    "内部错误：字符身份模型与位置模型全文不一致",
+                    "internal_error")
+
+            serial_pieces = [list(p)[:4] for p in pieces]  # 身份不入盘/不外显
             record = {
                 "id": pid,
                 "base_revision": base_revision,
@@ -208,6 +253,11 @@ class Service:
                 "result_text": new_text,
             }
             self._store.commit(record, new_text)
+            # 磁盘确认成功后再推进内存身份状态（崩溃后由历史重建，等价）
+            if is_insert:
+                self._anchors.commit_insert(pid, ids, norm_payload["text"])
+            else:
+                self._anchors.commit_delete(killed)
 
             return {"id": pid,
                     "revision": new_revision,

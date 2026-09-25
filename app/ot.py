@@ -23,7 +23,7 @@
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 Op = Tuple[str, int, int, str]  # 联合类型在 _make_* 中收窄
 InsOp = Tuple[str, int, str, str]
@@ -31,41 +31,66 @@ DelOp = Tuple[str, int, int, str]
 OpList = List[Tuple]
 
 
-def make_ins(pos: int, text: str, patch_id: str) -> InsOp:
-    return ("ins", int(pos), text, patch_id)
+def make_ins(pos: int, text: str, patch_id: str,
+             anchor: Optional[Tuple[int, ...]] = None) -> Tuple:
+    """构造插入操作。
+
+    anchor 为该插入首字符的全局定序身份（见 app.anchors）；带身份时
+    同位置并发插入按身份（即原始空隙先后 + 标识字典序）定序，不再退
+    化为只按标识排序，从而保证多个插入与删除交叠时仍与到达顺序无关。
+    """
+    return ("ins", int(pos), text, patch_id, anchor)
 
 
 def make_del(lo: int, hi: int, patch_id: str) -> DelOp:
     return ("del", int(lo), int(hi), patch_id)
 
 
+def _ins_anchor(op: Tuple):
+    return op[4] if len(op) >= 5 else None
+
+
+def _same_position_ins_first(x: Tuple, h: Tuple) -> bool:
+    """两条同位置并发插入：x 是否应排在 h 之前。
+
+    双方都带全局身份时按身份定序（身份已编码原始空隙与补丁标识）；
+    否则退回补丁标识字典序规则。
+    """
+    ax, ah = _ins_anchor(x), _ins_anchor(h)
+    if ax is not None and ah is not None:
+        return ax < ah
+    return x[3] < h[3]
+
+
 def transform(x: Tuple, h: Tuple) -> OpList:
     """把并发操作 x 改写为 "h 已应用之后" 的等价操作（可能拆成多条）。"""
     if x[0] == "ins" and h[0] == "ins":
-        _, p, text, pid = x
-        _, hp, htext, hid = h
+        _, p, text, pid = x[0], x[1], x[2], x[3]
+        _, hp, htext = h[0], h[1], h[2]
         if p < hp:
             return [x]
         if p > hp:
-            return [make_ins(p + len(htext), text, pid)]
-        # 同位置插入：补丁标识字典序小的在前
-        if pid < hid:
+            return [make_ins(p + len(htext), text, pid, _ins_anchor(x))]
+        # 同位置插入：全局身份（原始空隙先后 + 标识字典序）小的在前
+        if _same_position_ins_first(x, h):
             return [x]
-        return [make_ins(p + len(htext), text, pid)]
+        return [make_ins(p + len(htext), text, pid, _ins_anchor(x))]
 
     if x[0] == "ins" and h[0] == "del":
-        _, p, text, pid = x
+        _, p, text, pid = x[0], x[1], x[2], x[3]
         _, lo, hi, _ = h
+        anchor = _ins_anchor(x)
         if p <= lo:
             return [x]                      # 插入在删除区间之前
         if p >= hi:
-            return [make_ins(p - (hi - lo), text, pid)]  # 整体后移
-        # 插入点落在被删除区间内：插入内容保留在删除空隙（等价于夹到 hi-lo 处）
-        return [make_ins(lo, text, pid)]
+            return [make_ins(p - (hi - lo), text, pid, anchor)]  # 整体后移
+        # 插入点落在被删除区间内：插入内容保留在删除空隙（等价于夹到 lo 处）；
+        # 身份随操作保留，使多条被同一删除折叠的插入仍按原空隙先后排列
+        return [make_ins(lo, text, pid, anchor)]
 
     if x[0] == "del" and h[0] == "ins":
         _, lo, hi, pid = x
-        _, hp, htext, _ = h
+        hp, htext = h[1], h[2]
         length = len(htext)
         if hp <= lo:
             return [make_del(lo + length, hi + length, pid)]  # 插入在删除前
@@ -115,7 +140,7 @@ def apply_pieces(text: str, pieces: OpList) -> str:
         return text
     if pieces[0][0] == "ins":
         # 一次补丁经过变换后至多仍是一条插入
-        _, pos, itext, _ = pieces[0]
+        pos, itext = pieces[0][1], pieces[0][2]
         return text[:pos] + itext + text[pos:]
     # 删除：各区间互斥，从后向前删除以免位移
     result = text

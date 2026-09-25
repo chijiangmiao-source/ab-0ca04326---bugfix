@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import random
 import tempfile
 
 from app.service import Reject, Service
@@ -278,3 +280,104 @@ def test_state_file_single_json_and_no_temp_leftovers():
     assert data["patches"][0]["pieces"] == [["ins", 1, "Q", "p"]]
     leftovers = [n for n in os.listdir(tmp) if n.startswith(".state-")]
     assert leftovers == []
+
+
+# ---- 点名回归：三个 rev0 离线补丁（两插入 + 一删除）六种排列必须收敛 ----
+CONV_BASE = "0123456789abcdefg"
+CONV_PATCHES = {
+    "A": ins("A", 11, "A"),
+    "B": ins("B", 10, "B"),
+    "D": dele("D", 9, 12),
+}
+CONV_EXPECTED = "012345678BAcdefg"
+
+
+def _run_orders(base_text, reqs):
+    """每种提交排列各建一份全新文档状态，全部补丁仍携带 revision 0，
+    经现有补丁提交入口 Service.submit 依次提交，返回 {排列: 最终全文}。"""
+    results = {}
+    for order in itertools.permutations(sorted(reqs)):
+        tmp = tempfile.mkdtemp(prefix="ot-six-")
+        svc = Service(Store(os.path.join(tmp, "state.json"),
+                            initial_text=base_text))
+        for key in order:
+            resp = svc.submit(reqs[key])
+            assert resp["idempotent"] is False
+        doc = svc.document()
+        assert doc["revision"] == len(reqs)
+        results["".join(order)] = doc["text"]
+    return results
+
+
+def test_offline_rev0_two_inserts_and_delete_six_orders_converge():
+    results = _run_orders(CONV_BASE, CONV_PATCHES)
+    assert len(results) == 6
+    texts = set(results.values())
+    assert texts == {CONV_EXPECTED}, (
+        "同一组 revision 0 离线补丁未随六种提交排列收敛：\n  "
+        + "\n  ".join(f"{o}: {t!r}" for o, t in sorted(results.items())))
+
+
+def test_offline_rev0_six_orders_converge_after_restart():
+    # 每种排列都在第一条补丁后 “停服重启”（同一状态文件重建
+    # Service/身份状态），随后仍提交基于 revision 0 的剩余补丁
+    results = {}
+    for order in itertools.permutations(sorted(CONV_PATCHES)):
+        tmp = tempfile.mkdtemp(prefix="ot-six-restart-")
+        path = os.path.join(tmp, "state.json")
+        svc = Service(Store(path, initial_text=CONV_BASE))
+        svc.submit(CONV_PATCHES[order[0]])
+        svc = Service(Store(path))  # 重启：从补丁历史重建字符身份
+        for key in order[1:]:
+            svc.submit(CONV_PATCHES[key])
+        results["".join(order)] = svc.document()["text"]
+    assert set(results.values()) == {CONV_EXPECTED}, results
+
+
+def _expected_when_all_based_on_rev_zero(base_text, reqs):
+    """独立计算语义结果：删除按原坐标取字符集并集；插入一律保留，
+    同位置插入按补丁标识字典序，不同位置按原位置先后。"""
+    deleted = [False] * len(base_text)
+    at_pos = {}
+    for req in reqs.values():
+        payload = req["payload"]
+        if req["kind"] == "delete":
+            for i in range(payload["lo"], payload["hi"]):
+                deleted[i] = True
+        else:
+            at_pos.setdefault(payload["pos"], []).append(
+                (req["id"], payload["text"]))
+    out = []
+    for i, ch in enumerate(base_text):
+        for pid, text in sorted(at_pos.get(i, [])):
+            out.append(text)
+        if not deleted[i]:
+            out.append(ch)
+    for pid, text in sorted(at_pos.get(len(base_text), [])):
+        out.append(text)
+    return "".join(out)
+
+
+def test_random_offline_mixed_patches_all_orders_converge():
+    rng = random.Random(20260925)
+    alphabet = "甲乙丙AB012"
+    for case in range(120):
+        base_text = "".join(rng.choice(alphabet)
+                            for _ in range(rng.randint(1, 12)))
+        n = len(base_text)
+        reqs = {}
+        for k in range(rng.randint(2, 5)):
+            pid = f"t{case}-{k}"
+            if rng.random() < 0.55:
+                reqs[pid] = ins(
+                    pid, rng.randint(0, n),
+                    rng.choice("XY插") * rng.randint(1, 2))
+            else:
+                lo = rng.randint(0, n)
+                hi = rng.randint(lo, n)
+                reqs[pid] = dele(pid, lo, hi)
+        results = _run_orders(base_text, reqs)
+        expected = _expected_when_all_based_on_rev_zero(base_text, reqs)
+        assert set(results.values()) == {expected}, (
+            f"用例 {case}：{reqs}\n  期望 {expected!r}\n  实际 "
+            f"{set(results.values())!r}")
